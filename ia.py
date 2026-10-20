@@ -1,209 +1,144 @@
-from groq import Groq
 import json
 import random
+import ollama
 
-client = Groq(
-    api_key="Insira aqui sua Api Key da Groq"
-)
+MODELO = "qwen2.5:7b"   # use "qwen2.5:3b" se tiver pouca RAM
+cliente = ollama.Client(host="http://localhost:11434")
 
-PROMPT = """
-Você é um professor técnico de informática.
-
-Crie uma pergunta de múltipla escolha.
-
-Responda SOMENTE JSON válido.
-
-Formato obrigatório:
-
-{
-    "pergunta": "",
-    "opcoes": {
-        "A": {
-            "texto": "",
-            "correta": 0
+SCHEMA_PERGUNTA = {
+    "type": "object",
+    "properties": {
+        "pergunta": {"type": "string"},
+        "correta": {"type": "string"},
+        "erradas": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 3,
+            "maxItems": 3,
         },
-        "B": {
-            "texto": "",
-            "correta": 0
-        },
-        "C": {
-            "texto": "",
-            "correta": 0
-        },
-        "D": {
-            "texto": "",
-            "correta": 0
-        }
+        "explicacao": {"type": "string"},
     },
-    "explicacao": ""
+    "required": ["pergunta", "correta", "erradas", "explicacao"],
 }
 
-REGRAS:
+SCHEMA_LICAO = {
+    "type": "object",
+    "properties": {
+        "titulo": {"type": "string"},
+        "conteudo": {"type": "string"},
+        "exemplo": {"type": "string"},
+        "dica": {"type": "string"},
+    },
+    "required": ["titulo", "conteudo", "exemplo", "dica"],
+}
 
-- Exatamente 4 alternativas.
-- Apenas UMA alternativa deve ter "correta": 1.
-- A alternativa correta deve ser escolhida ALEATORIAMENTE entre A, B, C ou D — não use sempre a mesma letra.
-- Varie bastante qual letra é a correta a cada pergunta.
-- O campo "explicacao" deve conter de 1 a 2 frases curtas, em português, explicando
-  de forma simples por que a alternativa correta está certa (e, se ajudar, por que
-  as outras estão erradas). Escreva como se estivesse explicando para um aluno.
-- Apenas JSON.
-- Sem markdown.
-- Sem texto fora do JSON.
+PROMPT = """Você é um professor técnico de informática.
+Crie UMA pergunta de múltipla escolha.
+
+REGRAS:
+- "pergunta": a pergunta.
+- "correta": o texto da única alternativa correta.
+- "erradas": exatamente 3 alternativas incorretas, plausíveis, mas claramente erradas.
+- "explicacao": 1 a 2 frases curtas explicando por que a correta está certa,
+  como se falasse com um aluno.
+- Não coloque letras (A, B, C) nas alternativas.
 """
 
+PROMPT_LICAO = """Você é um professor técnico de informática que cria aulas curtas
+e didáticas para um curso dentro de um aplicativo de estudos.
 
-def gerar_pergunta(materia, idioma="pt"):
-    try:
-        # passa uma letra aleatória no prompt para forçar variação
-        letra_sugerida = random.choice(["A", "B", "C", "D"])
+REGRAS:
+- "titulo": nome curto do tópico (máx. 8 palavras).
+- "conteudo": explicação didática em 2 a 4 parágrafos curtos separados por \\n\\n,
+  adequada ao nível pedido, com analogias quando ajudar.
+- "exemplo": um exemplo prático e concreto, curto e direto.
+- "dica": uma dica prática de 1 frase.
+- Escolha um tópico específico dentro da matéria (não o mais óbvio).
+"""
 
-        instrucao_idioma = (
-            "Responda em português do Brasil."
-            if idioma == "pt" else
-            "Answer in English."
-        )
+def _idioma(idioma):
+    return "Responda em português do Brasil." if idioma == "pt" else "Answer in English."
 
-        resposta = client.chat.completions.create(
-            model="groq/compound",
-            messages=[
-                {
-                    "role": "system",
-                    "content": PROMPT
+def _chamar(system, user, schema, temperatura):
+    resposta = cliente.chat(
+        model=MODELO,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        format=schema,
+        options={"temperature": temperatura},
+        keep_alive="15m",   # mantém o modelo na memória entre chamadas
+    )
+    return json.loads(resposta["message"]["content"])
+
+def gerar_pergunta(materia, idioma="pt", tentativas=3):
+    for _ in range(tentativas):
+        try:
+            bruto = _chamar(
+                PROMPT,
+                f"Crie uma pergunta sobre {materia}. {_idioma(idioma)}",
+                SCHEMA_PERGUNTA,
+                temperatura=0.6,
+            )
+
+            correta = bruto["correta"].strip()
+            erradas = [e.strip() for e in bruto["erradas"]]
+            alternativas = [correta] + erradas
+
+            # validações: 4 textos não vazios e sem repetição
+            if len(erradas) != 3 or any(not a for a in alternativas):
+                continue
+            if len({a.lower() for a in alternativas}) != 4:
+                continue
+
+            # o Python sorteia a posição da correta
+            random.shuffle(alternativas)
+            dados = {
+                "pergunta": bruto["pergunta"].strip(),
+                "opcoes": {
+                    letra: {"texto": texto, "correta": 1 if texto == correta else 0}
+                    for letra, texto in zip("ABCD", alternativas)
                 },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Crie uma pergunta sobre {materia}. "
-                        f"Desta vez, a resposta correta deve ser a alternativa {letra_sugerida}. "
-                        f"{instrucao_idioma}"
-                    )
-                }
-            ],
-            temperature=0.9
-        )
+                "explicacao": bruto.get("explicacao", "").strip(),
+            }
 
-        texto = resposta.choices[0].message.content.strip()
+            if not dados["explicacao"]:
+                letra = obter_resposta_correta(dados)
+                dados["explicacao"] = (
+                    f"A alternativa correta é a {letra}: {correta}."
+                    if idioma == "pt"
+                    else f"The correct answer is {letra}: {correta}."
+                )
+            return dados
 
-        if texto.startswith("```json"):
-            texto = texto.replace("```json", "").replace("```", "")
+        except Exception as erro:
+            print(f"Erro Ollama (gerar_pergunta): {erro}")
 
-        texto = texto.strip()
-
-        dados = json.loads(texto)
-
-        # validação extra: se a IA ignorou e colocou tudo errado,
-        # verifica se tem exatamente 1 correta
-        corretas = sum(
-            1 for letra in ["A", "B", "C", "D"]
-            if dados["opcoes"][letra]["correta"] == 1
-        )
-
-        if corretas != 1:
-            print(f"IA retornou {corretas} respostas corretas — descartando e tentando novamente")
-            return gerar_pergunta(materia, idioma)
-
-        # garante que o campo sempre exista, mesmo se a IA esquecer
-        if "explicacao" not in dados or not dados["explicacao"]:
-            letra_correta = obter_resposta_correta(dados)
-            texto_correta = dados["opcoes"][letra_correta]["texto"]
-            if idioma == "pt":
-                dados["explicacao"] = f"A alternativa correta é a {letra_correta}: {texto_correta}."
-            else:
-                dados["explicacao"] = f"The correct answer is {letra_correta}: {texto_correta}."
-
-        return dados
-
-    except Exception as erro:
-        print(f"Erro Groq: {erro}")
-        return None
-
-
-PROMPT_LICAO = """
-Você é um professor técnico de informática que cria aulas curtas e didáticas
-para um curso dentro de um aplicativo de estudos.
-
-Responda SOMENTE JSON válido, sem markdown, sem texto fora do JSON.
-
-Formato obrigatório:
-
-{
-    "titulo": "",
-    "conteudo": "",
-    "exemplo": "",
-    "dica": ""
-}
-
-REGRAS:
-
-- "titulo": nome curto e chamativo do tópico da aula (máx. 8 palavras).
-- "conteudo": explicação didática do tópico, em português, entre 2 e 4 parágrafos
-  curtos (separados por \\n\\n), adequada ao nível pedido. Use uma linguagem clara,
-  com analogias quando ajudar a entender.
-- "exemplo": um exemplo prático e concreto do conteúdo explicado (pode ser um
-  trecho de código, uma situação do dia a dia, ou um cenário real). Curto e direto.
-- "dica": uma dica prática de 1 frase para o aluno fixar o conteúdo ou ir além.
-- Escolha um tópico ALEATÓRIO e específico dentro da matéria e nível pedidos
-  (não repita sempre o tópico mais óbvio) — varie bastante a cada chamada.
-- Apenas JSON.
-"""
-
+    return None
 
 def gerar_licao(materia, nivel, idioma="pt"):
-    """Gera o conteúdo de uma aula (curso) para uma matéria e nível específicos."""
+    """Gera o conteúdo de uma aula para uma matéria e nível específicos."""
     try:
-        instrucao_idioma = (
-            "Responda em português do Brasil."
-            if idioma == "pt" else
-            "Answer in English."
+        dados = _chamar(
+            PROMPT_LICAO,
+            f"Crie uma aula sobre {materia}, nível {nivel}. "
+            f"Escolha um tópico específico dentro desse tema. {_idioma(idioma)}",
+            SCHEMA_LICAO,
+            temperatura=0.8,
         )
-
-        resposta = client.chat.completions.create(
-            model="groq/compound",
-            messages=[
-                {
-                    "role": "system",
-                    "content": PROMPT_LICAO
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Crie uma aula sobre {materia}, nível {nivel}. "
-                        f"Escolha um tópico específico e interessante dentro desse tema. "
-                        f"{instrucao_idioma}"
-                    )
-                }
-            ],
-            temperature=1.0
-        )
-
-        texto = resposta.choices[0].message.content.strip()
-
-        if texto.startswith("```json"):
-            texto = texto.replace("```json", "").replace("```", "")
-        elif texto.startswith("```"):
-            texto = texto.replace("```", "")
-
-        texto = texto.strip()
-
-        dados = json.loads(texto)
-
         for campo in ("titulo", "conteudo", "exemplo", "dica"):
             dados.setdefault(campo, "")
-
         return dados
-
     except Exception as erro:
-        print(f"Erro Groq (gerar_licao): {erro}")
+        print(f"Erro Ollama (gerar_licao): {erro}")
         return None
-
 
 def obter_resposta_correta(dados):
     for letra in ["A", "B", "C", "D"]:
         if dados["opcoes"][letra]["correta"] == 1:
             return letra
     return None
-
 
 def verificar_resposta(dados, resposta_usuario):
     correta = obter_resposta_correta(dados)
